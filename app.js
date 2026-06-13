@@ -50,6 +50,9 @@ async function updateCellByPropertyName(propertyName, columnLetter, newValue) {
   const sheetNames = spreadsheet.data.sheets.map(s => s.properties.title);
 
   for (const sheetName of sheetNames) {
+    // シート1はメッセージ記録用なのでスキップ
+    if (sheetName === 'シート1') continue;
+
     // B列（物件名）を取得
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: SPREADSHEET_ID,
