@@ -23,9 +23,7 @@ function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') {
     return Promise.resolve(null);
   }
-
   const userMessage = event.message.text;
-
   return client.replyMessage(event.replyToken, {
     type: 'text',
     text: '受け取りました：' + userMessage
