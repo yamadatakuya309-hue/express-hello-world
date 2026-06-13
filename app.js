@@ -21,7 +21,7 @@ async function appendToSheet(values) {
   const sheets = google.sheets({ version: 'v4', auth });
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: 'Sheet1!A:D',
+    range: 'シート1!A:D',
     valueInputOption: 'USER_ENTERED',
     resource: { values: [values] },
   });
