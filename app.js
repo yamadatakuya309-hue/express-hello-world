@@ -1,5 +1,6 @@
 const express = require('express');
 const line = require('@line/bot-sdk');
+const { google } = require('googleapis');
 
 const app = express();
 
@@ -9,6 +10,22 @@ const config = {
 };
 
 const client = new line.Client(config);
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+
+async function appendToSheet(values) {
+  const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+  const sheets = google.sheets({ version: 'v4', auth });
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: 'Sheet1!A:D',
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: [values] },
+  });
+}
 
 app.post('/webhook', line.middleware(config), (req, res) => {
   Promise.all(req.body.events.map(handleEvent))
@@ -19,7 +36,7 @@ app.post('/webhook', line.middleware(config), (req, res) => {
     });
 });
 
-function handleEvent(event) {
+async function handleEvent(event) {
   if (event.type === 'join') {
     return client.replyMessage(event.replyToken, {
       type: 'text',
@@ -32,6 +49,11 @@ function handleEvent(event) {
   }
 
   const userMessage = event.message.text;
+  const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  const userId = event.source.userId || '';
+  const groupId = event.source.groupId || '個人トーク';
+
+  await appendToSheet([now, userId, groupId, userMessage]);
 
   return client.replyMessage(event.replyToken, {
     type: 'text',
