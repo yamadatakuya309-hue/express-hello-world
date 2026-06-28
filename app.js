@@ -92,7 +92,6 @@ async function completeByCode(identCode, completionValue) {
         const rowNumber = i + 1;
 
         // J列(10)以降を右に向かって無限に探す
-        // まず行全体を取得
         const resRow = await sheets.spreadsheets.values.get({
           spreadsheetId: SPREADSHEET_ID,
           range: `${sheetName}!${rowNumber}:${rowNumber}`,
@@ -171,6 +170,50 @@ async function updateCellByPropertyName(propertyName, columnLetter, newValue) {
 }
 
 // ============================
+// 【新機能】複数の識別コードをまとめたメッセージを解析する
+// 例：
+//   伊勢崎市西久保1-3、\n伊勢崎市西久保1-5、\n完了です
+//   → ['伊勢崎市西久保1-3', '伊勢崎市西久保1-5'] と worker='完了です'
+//
+// ルール：
+//   - 改行で各行に分割
+//   - 末尾の「、」「，」「,」を除去
+//   - 「完了」「終了」「以上」「done」「ok」で始まる行 → worker（担当者名）として扱う
+//   - 空行は除外
+//   - 担当者名が見つからなかった場合は最後の行を担当者名として扱う
+// ============================
+function parseCompletionMessage(text) {
+  // 改行で分割し、前後の空白と末尾の読点を除去
+  const lines = text
+    .split(/\n/)
+    .map(line => line.trim().replace(/[、，,]$/, ''))
+    .filter(line => line.length > 0);
+
+  // 「完了」「終了」「以上」「done」「ok」で始まる行を担当者/ステータス行として検出
+  const statusPattern = /^(完了|終了|以上|done|ok)/i;
+
+  const identCodes = [];
+  let worker = null;
+
+  for (const line of lines) {
+    if (statusPattern.test(line)) {
+      // ステータス行：「完了です」→ worker = '完了'、「完了 荒岡」→ worker = '荒岡'
+      const workerMatch = line.replace(statusPattern, '').trim();
+      worker = workerMatch.length > 0 ? workerMatch : line;
+    } else {
+      identCodes.push(line);
+    }
+  }
+
+  // 担当者名が見つからなかった場合は最後の行を担当者として扱う
+  if (!worker && identCodes.length > 0) {
+    worker = identCodes.pop();
+  }
+
+  return { identCodes, worker };
+}
+
+// ============================
 // Webhookエンドポイント
 // ============================
 app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
@@ -183,7 +226,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     if (event.type === 'join') {
       await client.replyMessage(event.replyToken, {
         type: 'text',
-        text: '植栽メンテナンス報告システムへようこそ！\n\n【完了報告】\n識別コード、担当者名\n例：伊勢崎市東町3-4、荒岡\n\n【セル直接更新】\n更新 物件名 列 内容\n例：更新 山田様邸　請負工事 J 2026.06.13山田施工',
+        text: '植栽メンテナンス報告システムへようこそ！\n\n【完了報告】\n識別コード、担当者名\n例：伊勢崎市東町3-4、荒岡\n\n【複数まとめて完了報告】\n識別コードを改行して最後に担当者名\n例：\n伊勢崎市西久保1-3、\n伊勢崎市西久保1-5、\n荒岡\n\n【セル直接更新】\n更新 物件名 列 内容\n例：更新 山田様邸　請負工事 J 2026.06.13山田施工',
       });
       continue;
     }
@@ -196,61 +239,74 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     const datetime = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
 
     // ============================
-    // 完了報告：識別コード、担当者名
+    // 完了報告：識別コード（複数可）、担当者名
     // 読点（、）が含まれていて「更新 」で始まらない場合
     // ============================
     if (text.includes('、') && !text.startsWith('更新 ')) {
-      const parts = text.split('、');
-      if (parts.length < 2) {
-        const errorDetail = '完了報告の形式エラー：読点の前後に内容がありません';
+
+      const { identCodes, worker } = parseCompletionMessage(text);
+
+      if (identCodes.length === 0 || !worker) {
+        const errorDetail = '完了報告の形式エラー：識別コードまたは担当者名が取得できませんでした';
         await appendToErrorLog(datetime, senderId, groupId, text, errorDetail);
         await client.replyMessage(event.replyToken, {
           type: 'text',
-          text: '⚠️ 形式が正しくありません。\n\n正しい形式：\n識別コード、担当者名\n\n例：\n伊勢崎市東町3-4、荒岡\n\n※内容は管理者が確認します。',
+          text: '⚠️ 形式が正しくありません。\n\n【1件の場合】\n識別コード、担当者名\n例：伊勢崎市東町3-4、荒岡\n\n【複数の場合】\n識別コードを改行して最後に担当者名\n例：\n伊勢崎市西久保1-3、\n伊勢崎市西久保1-5、\n荒岡\n\n※内容は管理者が確認します。',
         });
         continue;
       }
-
-      const identCode = parts[0].trim();
-      const worker = parts[1].trim();
 
       // 今日の日付を自動取得
       const today = new Date();
       const dateStr = `${today.getFullYear()}.${String(today.getMonth() + 1).padStart(2, '0')}.${String(today.getDate()).padStart(2, '0')}`;
       const completionValue = `${dateStr} ${worker}`;
 
-      try {
-        const result = await completeByCode(identCode, completionValue);
-
-        if (result.success) {
-          await client.replyMessage(event.replyToken, {
-            type: 'text',
-            text: `✅ 完了報告を記録しました！\n\n現場：${identCode}\nシート：${result.sheetName}\n列：${result.column}列\n記録内容：${completionValue}`,
-          });
-        } else if (result.reason === 'no_yotei') {
-          const errorDetail = `「予定」セルなし：識別コード「${identCode}」（${result.sheetName}）のJ列以降に「予定」が見つかりませんでした`;
-          await appendToErrorLog(datetime, senderId, groupId, text, errorDetail);
-          await client.replyMessage(event.replyToken, {
-            type: 'text',
-            text: `⚠️ 「${identCode}」の予定セルが見つかりませんでした。\n\n内容は記録しましたので管理者が確認します。`,
-          });
-        } else {
-          const errorDetail = `識別コード「${identCode}」がスプレッドシートに見つかりませんでした`;
-          await appendToErrorLog(datetime, senderId, groupId, text, errorDetail);
-          await client.replyMessage(event.replyToken, {
-            type: 'text',
-            text: `⚠️ 「${identCode}」が見つかりませんでした。\n\n内容は記録しましたので管理者が確認します。`,
-          });
+      // 複数の識別コードを順番に処理
+      const results = [];
+      for (const identCode of identCodes) {
+        try {
+          const result = await completeByCode(identCode, completionValue);
+          results.push({ identCode, ...result });
+        } catch (err) {
+          results.push({ identCode, success: false, reason: 'error', error: err.message });
         }
-      } catch (err) {
-        const errorDetail = `システムエラー：${err.message}`;
-        await appendToErrorLog(datetime, senderId, groupId, text, errorDetail);
-        console.error('完了報告エラー:', err);
-        await client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: '⚠️ エラーが発生しました。\n\n内容は記録しましたので管理者が確認します。',
-        });
       }
+
+      // 結果のサマリーを作成
+      const successList = results.filter(r => r.success);
+      const failList = results.filter(r => !r.success);
+
+      let replyText = '';
+
+      if (successList.length > 0) {
+        replyText += `✅ ${successList.length}件の完了報告を記録しました！\n`;
+        replyText += `記録内容：${completionValue}\n\n`;
+        for (const r of successList) {
+          replyText += `・${r.identCode}（${r.sheetName} ${r.column}列）\n`;
+        }
+      }
+
+      if (failList.length > 0) {
+        replyText += `\n⚠️ ${failList.length}件が記録できませんでした：\n`;
+        for (const r of failList) {
+          const reason =
+            r.reason === 'no_yotei' ? '「予定」セルが見つかりません' :
+            r.reason === 'not_found' ? '識別コードが見つかりません' :
+            'エラーが発生しました';
+          replyText += `・${r.identCode}：${reason}\n`;
+
+          // エラーログに記録
+          await appendToErrorLog(datetime, senderId, groupId, text,
+            `識別コード「${r.identCode}」：${reason}`);
+        }
+        replyText += '\n内容は管理者が確認します。';
+      }
+
+      await client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: replyText.trim(),
+      });
+
       continue;
     }
 
