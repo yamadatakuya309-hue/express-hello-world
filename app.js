@@ -79,7 +79,6 @@ async function completeByCode(identCode, completionValue) {
   for (const sheetName of sheetNames) {
     if (sheetName === 'シート1' || sheetName === 'エラーログ') continue;
 
-    // E列（識別コード）を取得
     const resE = await sheets.spreadsheets.values.get({
       spreadsheetId: SPREADSHEET_ID,
       range: `${sheetName}!E:E`,
@@ -91,7 +90,6 @@ async function completeByCode(identCode, completionValue) {
       if (cellValue === identCode.trim()) {
         const rowNumber = i + 1;
 
-        // J列(10)以降を右に向かって無限に探す
         const resRow = await sheets.spreadsheets.values.get({
           spreadsheetId: SPREADSHEET_ID,
           range: `${sheetName}!${rowNumber}:${rowNumber}`,
@@ -99,11 +97,9 @@ async function completeByCode(identCode, completionValue) {
 
         const rowData = (resRow.data.values || [[]])[0] || [];
 
-        // J列はindex9（A=0,B=1,...,J=9）
         for (let colIndex = 9; colIndex < rowData.length + 20; colIndex++) {
           const colValue = (rowData[colIndex] || '').trim();
 
-          // 「予定」のみ（完全一致）
           if (colValue === '予定') {
             const colLetter = colNumberToLetter(colIndex + 1);
             const updateRange = `${sheetName}!${colLetter}${rowNumber}`;
@@ -116,7 +112,6 @@ async function completeByCode(identCode, completionValue) {
             return { success: true, sheetName, rowNumber, column: colLetter };
           }
 
-          // 空欄が3連続したら終了
           if (
             (rowData[colIndex] || '').trim() === '' &&
             (rowData[colIndex + 1] || '').trim() === '' &&
@@ -124,7 +119,6 @@ async function completeByCode(identCode, completionValue) {
           ) break;
         }
 
-        // 物件は見つかったが「予定」セルがない
         return { success: false, reason: 'no_yotei', sheetName };
       }
     }
@@ -170,47 +164,65 @@ async function updateCellByPropertyName(propertyName, columnLetter, newValue) {
 }
 
 // ============================
-// 【新機能】複数の識別コードをまとめたメッセージを解析する
-// 例：
-//   伊勢崎市西久保1-3、\n伊勢崎市西久保1-5、\n完了です
-//   → ['伊勢崎市西久保1-3', '伊勢崎市西久保1-5'] と worker='完了です'
+// メッセージを解析して「識別コードと担当者名」のペア一覧を返す
 //
-// ルール：
-//   - 改行で各行に分割
-//   - 末尾の「、」「，」「,」を除去
-//   - 「完了」「終了」「以上」「done」「ok」で始まる行 → worker（担当者名）として扱う
-//   - 空行は除外
-//   - 担当者名が見つからなかった場合は最後の行を担当者名として扱う
+// 対応フォーマット：
+//
+// 【パターンA】各行に担当者名あり（今回の問題ケース）
+//   太田市南矢島1-1、荒岡
+//   太田市南矢島1-2、荒岡
+//   太田市南矢島1-3、荒岡
+//   → [{identCode:'太田市南矢島1-1', worker:'荒岡'}, ...]
+//
+// 【パターンB】識別コードのみ複数行、最後に担当者名
+//   伊勢崎市西久保1-3、
+//   伊勢崎市西久保1-5、
+//   荒岡
+//   → [{identCode:'伊勢崎市西久保1-3', worker:'荒岡'}, ...]
+//
+// 【パターンC】1件のみ
+//   伊勢崎市東町3-4、荒岡
+//   → [{identCode:'伊勢崎市東町3-4', worker:'荒岡'}]
 // ============================
 function parseCompletionMessage(text) {
-  // 改行で分割し、前後の空白と末尾の読点を除去
+  // 改行で分割し、前後の空白を除去・空行を除外
   const lines = text
     .split(/\n/)
-    .map(line => line.trim().replace(/[、，,]$/, ''))
+    .map(line => line.trim())
     .filter(line => line.length > 0);
 
-  // 「完了」「終了」「以上」「done」「ok」で始まる行を担当者/ステータス行として検出
-  const statusPattern = /^(完了|終了|以上|done|ok)/i;
-
-  const identCodes = [];
-  let worker = null;
+  const entries = [];
 
   for (const line of lines) {
-    if (statusPattern.test(line)) {
-      // ステータス行：「完了です」→ worker = '完了'、「完了 荒岡」→ worker = '荒岡'
-      const workerMatch = line.replace(statusPattern, '').trim();
-      worker = workerMatch.length > 0 ? workerMatch : line;
-    } else {
-      identCodes.push(line);
+    // 「、」が含まれる行 → 「識別コード、担当者名」として解析
+    if (line.includes('、')) {
+      const separatorIndex = line.indexOf('、');
+      const identCode = line.substring(0, separatorIndex).trim();
+      const worker = line.substring(separatorIndex + 1).trim();
+
+      if (identCode) {
+        entries.push({
+          identCode,
+          // 担当者名が空（例：「伊勢崎市西久保1-3、」）の場合はnullにして後で補完
+          worker: worker.length > 0 ? worker : null,
+        });
+      }
+    }
+    // 「、」が含まれない行 → 担当者名のみの行（パターンBの最終行）
+    else {
+      const workerOnly = line.trim();
+      if (workerOnly.length > 0) {
+        // 直前までのworkerがnullのエントリに担当者名を補完
+        for (const entry of entries) {
+          if (entry.worker === null) {
+            entry.worker = workerOnly;
+          }
+        }
+      }
     }
   }
 
-  // 担当者名が見つからなかった場合は最後の行を担当者として扱う
-  if (!worker && identCodes.length > 0) {
-    worker = identCodes.pop();
-  }
-
-  return { identCodes, worker };
+  return entries;
 }
 
 // ============================
@@ -226,7 +238,7 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     if (event.type === 'join') {
       await client.replyMessage(event.replyToken, {
         type: 'text',
-        text: '植栽メンテナンス報告システムへようこそ！\n\n【完了報告】\n識別コード、担当者名\n例：伊勢崎市東町3-4、荒岡\n\n【複数まとめて完了報告】\n識別コードを改行して最後に担当者名\n例：\n伊勢崎市西久保1-3、\n伊勢崎市西久保1-5、\n荒岡\n\n【セル直接更新】\n更新 物件名 列 内容\n例：更新 山田様邸　請負工事 J 2026.06.13山田施工',
+        text: '植栽メンテナンス報告システムへようこそ！\n\n【完了報告（1件）】\n識別コード、担当者名\n例：伊勢崎市東町3-4、荒岡\n\n【完了報告（複数・担当者名を各行に）】\n太田市南矢島1-1、荒岡\n太田市南矢島1-2、荒岡\n\n【完了報告（複数・担当者名を最後に）】\n伊勢崎市西久保1-3、\n伊勢崎市西久保1-5、\n荒岡\n\n【セル直接更新】\n更新 物件名 列 内容\n例：更新 山田様邸　請負工事 J 2026.06.13山田施工',
       });
       continue;
     }
@@ -239,19 +251,30 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
     const datetime = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
 
     // ============================
-    // 完了報告：識別コード（複数可）、担当者名
-    // 読点（、）が含まれていて「更新 」で始まらない場合
+    // 完了報告：「、」が含まれていて「更新 」で始まらない場合
     // ============================
     if (text.includes('、') && !text.startsWith('更新 ')) {
 
-      const { identCodes, worker } = parseCompletionMessage(text);
+      const entries = parseCompletionMessage(text);
 
-      if (identCodes.length === 0 || !worker) {
-        const errorDetail = '完了報告の形式エラー：識別コードまたは担当者名が取得できませんでした';
-        await appendToErrorLog(datetime, senderId, groupId, text, errorDetail);
+      // 解析失敗
+      if (entries.length === 0) {
+        await appendToErrorLog(datetime, senderId, groupId, text, '完了報告の解析失敗：エントリが0件');
         await client.replyMessage(event.replyToken, {
           type: 'text',
-          text: '⚠️ 形式が正しくありません。\n\n【1件の場合】\n識別コード、担当者名\n例：伊勢崎市東町3-4、荒岡\n\n【複数の場合】\n識別コードを改行して最後に担当者名\n例：\n伊勢崎市西久保1-3、\n伊勢崎市西久保1-5、\n荒岡\n\n※内容は管理者が確認します。',
+          text: '⚠️ 形式が正しくありません。\n\n例：\n伊勢崎市東町3-4、荒岡\n\n※内容は管理者が確認します。',
+        });
+        continue;
+      }
+
+      // 担当者名が取得できなかったエントリがある
+      const missingWorker = entries.filter(e => !e.worker);
+      if (missingWorker.length > 0) {
+        await appendToErrorLog(datetime, senderId, groupId, text,
+          `担当者名が取得できませんでした：${missingWorker.map(e => e.identCode).join('、')}`);
+        await client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: '⚠️ 担当者名が読み取れませんでした。\n\n【各行に担当者名をつける場合】\n太田市南矢島1-1、荒岡\n太田市南矢島1-2、荒岡\n\n【最後にまとめて担当者名をつける場合】\n伊勢崎市西久保1-3、\n伊勢崎市西久保1-5、\n荒岡\n\n※内容は管理者が確認します。',
         });
         continue;
       }
@@ -259,30 +282,29 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
       // 今日の日付を自動取得
       const today = new Date();
       const dateStr = `${today.getFullYear()}.${String(today.getMonth() + 1).padStart(2, '0')}.${String(today.getDate()).padStart(2, '0')}`;
-      const completionValue = `${dateStr} ${worker}`;
 
-      // 複数の識別コードを順番に処理
+      // 各エントリを順番に処理
       const results = [];
-      for (const identCode of identCodes) {
+      for (const entry of entries) {
+        const completionValue = `${dateStr} ${entry.worker}`;
         try {
-          const result = await completeByCode(identCode, completionValue);
-          results.push({ identCode, ...result });
+          const result = await completeByCode(entry.identCode, completionValue);
+          results.push({ ...entry, completionValue, ...result });
         } catch (err) {
-          results.push({ identCode, success: false, reason: 'error', error: err.message });
+          results.push({ ...entry, completionValue, success: false, reason: 'error', error: err.message });
         }
       }
 
-      // 結果のサマリーを作成
+      // 結果サマリーを作成
       const successList = results.filter(r => r.success);
       const failList = results.filter(r => !r.success);
 
       let replyText = '';
 
       if (successList.length > 0) {
-        replyText += `✅ ${successList.length}件の完了報告を記録しました！\n`;
-        replyText += `記録内容：${completionValue}\n\n`;
+        replyText += `✅ ${successList.length}件の完了報告を記録しました！\n\n`;
         for (const r of successList) {
-          replyText += `・${r.identCode}（${r.sheetName} ${r.column}列）\n`;
+          replyText += `・${r.identCode}（${r.sheetName} ${r.column}列）\n  ${r.completionValue}\n`;
         }
       }
 
@@ -294,8 +316,6 @@ app.post('/webhook', line.middleware(lineConfig), async (req, res) => {
             r.reason === 'not_found' ? '識別コードが見つかりません' :
             'エラーが発生しました';
           replyText += `・${r.identCode}：${reason}\n`;
-
-          // エラーログに記録
           await appendToErrorLog(datetime, senderId, groupId, text,
             `識別コード「${r.identCode}」：${reason}`);
         }
